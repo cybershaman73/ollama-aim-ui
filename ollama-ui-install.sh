@@ -88,7 +88,7 @@ CRT_FILE="./${AIM_IP}.pem"
 [[ -f "${KEY_FILE}" && -f "${CRT_FILE}" ]] || mkcert "${AIM_IP}"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Write EXACT working vite.config.ts with your stream/chat mapping
+# Modify vite.config.ts per env and set for hybrid chat operations
 # ──────────────────────────────────────────────────────────────────────────────
 VITE_CFG="${REPO_DIR}/vite.config.ts"
 cat > "${VITE_CFG}" <<EOF
@@ -145,7 +145,7 @@ export default defineConfig(({ mode }) => {
 EOF
 
 # ──────────────────────────────────────────────────────────────────────────────
-# .env.local (stable; just populate)
+# .env.local
 # ──────────────────────────────────────────────────────────────────────────────
 ENV_FILE="${REPO_DIR}/.env.local"
 cat > "${ENV_FILE}" <<EOF
@@ -182,7 +182,7 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Start dev server in tmux
+# Start Ollama UI Server in tmux
 # ──────────────────────────────────────────────────────────────────────────────
 manage_tmux start
 

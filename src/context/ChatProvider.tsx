@@ -44,251 +44,245 @@ const ChatProvider: React.FC<ChatProviderProps> = ({ children }) => {
   const [availableModels, setAvailableModels] = useState<IAvailableModels>([]);
   const [model, setModel] = useState<string>("gemma2:2b");
 
-  const addMessage = async (content: string) => {
-    if (!content.trim() || isLoading || !walletAddress) return;
+const addMessage = async (content: string) => {
+  if (!content.trim() || isLoading || !walletAddress) return;
 
-    const nodeUrl = import.meta.env.VITE_NODE_URL as string;  // e.g. https://172.27.126.244:8880
-    const slot = import.meta.env.VITE_AIM_SLOT as string;     // e.g. 0
-    const action = import.meta.env.VITE_AIM_URI as string;    // e.g. /request
+  const nodeUrl   = import.meta.env.VITE_NODE_URL;
+  const slot      = import.meta.env.VITE_AIM_SLOT;
+  const action    = import.meta.env.VITE_AIM_URI;     // e.g. "/request"
+  const streamHost = import.meta.env.VITE_STREAM_HOST;
 
-    // Sanitize stream base (allow empty → same-origin)
-    const rawStreamBase = (import.meta.env.VITE_STREAM_HOST as string) || "";
-    const streamBase = rawStreamBase.replace(/\/+$/, ""); // strip trailing slash
+  // Add user message
+  const userMessage: ChatMessage = { role: "user", content: content.trim() };
+  setMessages((prev) => [...prev, userMessage]);
 
-    // Add user message to chat
-    const userMessage: ChatMessage = { role: "user", content: content.trim() };
-    setMessages((prev) => [...prev, userMessage]);
+  setIsLoading(true);
 
-    setIsLoading(true);
+  // Temp assistant message for streaming
+  setMessages((prev) => [
+    ...prev,
+    { role: "assistant", content: "", isStreaming: true },
+  ]);
 
-    // Add temporary assistant message that will be updated with streaming/final content
-    setMessages((prev) => [
-      ...prev,
-      { role: "assistant", content: "", isStreaming: true },
-    ]);
-
-    try {
-      // Ensure selected model is advertised
-      if (!availableModels?.includes(model)) {
-        toast.error(`Model ${model} is not available`);
-        console.error(`Model ${model} is not available`);
-        return;
-      }
-
-      // Build chat payload for the request/token endpoint
-      const messagePayload = {
-        model: model,
-        messages: [
-          { role: "system", content: "You are a helpful assistant." },
-          ...messages,
-          userMessage,
-        ],
-      };
-
-      // 1) Ask AIM for a streaming token (POST to `action`, e.g., /request)
-      const request = await hypercycle.aimFetch(
-        walletAddress,
-        nodeUrl,
-        slot,
-        "POST",
-        action,
-        {},
-        JSON.stringify(messagePayload),
-        {},
-        "ethereum"
-      );
-
-      if (request.status === 402) {
-        const requestBody = await request.text();
-        alert("Payment required. Please check your wallet balance. " + requestBody);
-        return;
-      }
-
-      let accumulatedResponse = "";
-      let streamed = false;
-
-      // Try to parse token JSON
-      let tokenResp: AIMResponse | null = null;
-      try {
-        tokenResp = (await request.json()) as AIMResponse;
-      } catch {
-        tokenResp = null;
-      }
-
-      // Helper: POST JSON with token
-      const postJSON = (url: string, token: string) =>
-        fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token }),
-        });
-
-      // Helper: try advertised stream_url first (rewrite localhost → Vite origin)
-      const tryStreamUrlFirst = async (resp: AIMResponse) => {
-        if (!resp?.token) return null;
-        const raw = resp.stream_url;
-        if (!raw || typeof raw !== "string") return null;
-        try {
-          const u = new URL(raw);
-          // Keep only the path from server's advertised URL, prepend our Vite origin (streamBase)
-          // Example: "http://localhost:4001/stream" → "https://<vite-host>:8880/stream"
-          const rewritten = `${streamBase}${u.pathname}`;
-          const res = await postJSON(rewritten, resp.token);
-          return res;
-        } catch {
-          return null;
-        }
-      };
-
-      // 2) If we have a token, try streaming: stream_url → /chat → /stream/chat
-      if (tokenResp?.token) {
-        // a) Prefer server-advertised stream_url if present
-        let stream = await tryStreamUrlFirst(tokenResp);
-
-        // b) Fallback to direct /chat (→ :4001/chat via proxy)
-        if (!stream || stream.status === 404) {
-          stream = await postJSON(`${streamBase}/chat`, tokenResp.token);
-        }
-
-        // c) Fallback to legacy /stream/chat (proxy rewrites to /chat if configured)
-        if (stream && stream.status === 404) {
-          stream = await postJSON(`${streamBase}/stream/chat`, tokenResp.token);
-        }
-
-        if (stream && stream.ok && stream.body) {
-          // Read the SSE-like stream of tokens
-          const reader = stream.body.getReader();
-          const decoder = new TextDecoder("utf-8");
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const textChunk = decoder.decode(value, { stream: true });
-            const lines = textChunk.split("\n").filter((line) => line.trim() !== "");
-
-            for (let line of lines) {
-              if (line.startsWith("data:")) line = line.slice(5).trim();
-              if (!line) continue;
-
-              try {
-                const jsonResponse = JSON.parse(line) as TokenResponse;
-                if (jsonResponse.token) {
-                  accumulatedResponse += jsonResponse.token;
-                  setMessages((prev) => {
-                    const newMessages = [...prev];
-                    const last = newMessages.length - 1;
-                    if (last >= 0) {
-                      newMessages[last] = {
-                        role: "assistant",
-                        content: accumulatedResponse,
-                        isStreaming: true,
-                      };
-                    }
-                    return newMessages;
-                  });
-                }
-              } catch {
-                // ignore non-JSON lines
-              }
-            }
-          }
-
-          streamed = true;
-        } else if (stream && stream.status !== 404) {
-          // Some other error than 404 from stream path
-          const text = await stream.text().catch(() => "");
-          throw new Error(`Stream error ${stream.status}: ${text}`);
-        }
-      }
-
-      // 3) Fallback: if streaming failed or not available, do non-streaming chat via AIM
-      if (!streamed) {
-        const nonStreamUrl = `${nodeUrl}/aim/${slot}/chat`;
-        const resp = await fetch(nonStreamUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(messagePayload),
-        });
-
-        if (!resp.ok) {
-          const text = await resp.text().catch(() => "");
-          throw new Error(`Non-stream chat error ${resp.status}: ${text}`);
-        }
-
-        // Accept either { content } or OpenAI-like shapes or plain text
-        let txt = "";
-        try {
-          const j = await resp.json();
-          if (typeof j === "string") txt = j;
-          else if (typeof j?.content === "string") txt = j.content;
-          else if (Array.isArray(j?.choices) && j.choices[0]?.message?.content) {
-            txt = j.choices[0].message.content;
-          } else {
-            txt = JSON.stringify(j);
-          }
-        } catch {
-          txt = await resp.text();
-        }
-
-        accumulatedResponse = txt;
-        setMessages((prev) => {
-          const newMessages = [...prev];
-          const last = newMessages.length - 1;
-          if (last >= 0) {
-            newMessages[last] = {
-              role: "assistant",
-              content: accumulatedResponse,
-              isStreaming: false,
-            };
-          }
-          return newMessages;
-        });
-      } else {
-        // Streaming complete - finalize
-        setMessages((prev) => {
-          const newMessages = [...prev];
-          const last = newMessages.length - 1;
-          if (last >= 0) {
-            newMessages[last] = {
-              role: "assistant",
-              content: accumulatedResponse,
-              isStreaming: false,
-            };
-          }
-          return newMessages;
-        });
-      }
-    } catch (error) {
-      console.error("Error in agent request:", error);
-      toast.error("Error in agent request: " + error);
-      setMessages((prev) => {
-        const newMessages = [...prev];
-        const last = newMessages.length - 1;
-        if (last >= 0) {
-          newMessages[last] = {
-            role: "assistant",
-            content: "Sorry, an error occurred while processing your request.",
-            isStreaming: false,
-            error: true,
-          };
-        }
-        return newMessages;
-      });
-    } finally {
-      setIsLoading(false);
-    }
+  // The message payload we send to the AIM
+  const messagePayload = {
+    model,
+    messages: [
+      { role: "system", content: "You are a helpful assistant." },
+      ...messages,
+      userMessage,
+    ],
   };
+
+  // Small helper for the streaming POST
+  const postStream = async (url: string, token: string) => {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    if (!res.ok) {
+      throw new Error(`Stream error ${res.status}: ${await res.text()}`);
+    }
+    return res;
+  };
+
+  // Helper: try aimFetch once, optionally forcing a fresh nonce
+  const tryAimFetch = async (forceNonce = false) => {
+    try {
+      // Optional: force-refresh nonce if supported by hypercyclejs
+      if (forceNonce && typeof (hypercycle as any)?.refreshNonce === "function") {
+        await (hypercycle as any).refreshNonce(nodeUrl, walletAddress);
+      }
+    } catch {
+      // ignore if helper not present
+    }
+
+    const req = await hypercycle.aimFetch(
+      walletAddress,
+      nodeUrl,
+      slot,
+      "POST",
+      action,
+      {},
+      JSON.stringify(messagePayload),
+      {},
+      "ethereum"
+    );
+    return req;
+  };
+
+  try {
+    // 1) Make the signed request to the AIM to get the stream token
+    let request = await tryAimFetch(false);
+
+    // If payment required or unauthorized, surface early
+    if (request.status === 402) {
+      const body = await request.text();
+      toast.error("Payment required. " + body);
+      throw new Error("402 Payment Required");
+    }
+    if (request.status === 400 || request.status === 401) {
+      // Read body once to inspect error
+      const bodyText = await request.text();
+      if (/invalid\s*nonce/i.test(bodyText)) {
+        // Retry ONCE with a forced nonce refresh
+        try {
+          request = await tryAimFetch(true);
+        } catch (e) {
+          throw new Error(`Retry after nonce refresh failed: ${String(e)}`);
+        }
+        if (!request.ok) {
+          const secondBody = await request.text();
+          throw new Error(`After nonce refresh still failing: ${request.status} ${secondBody}`);
+        }
+      } else {
+        throw new Error(`Signed request failed: ${request.status} ${bodyText}`);
+      }
+    }
+
+    if (!request.ok) {
+      // e.g., intermittent 500 from AIM
+      const errBody = await request.text();
+      throw new Error(`AIM error ${request.status}: ${errBody}`);
+    }
+
+    const tokenResp = (await request.json()) as { token?: string; stream_url?: string; status?: string };
+    if (!tokenResp?.token) {
+      throw new Error(`Token missing in response: ${JSON.stringify(tokenResp)}`);
+    }
+
+    // 2) Start streaming with robust fallbacks (no signed non-stream fallback)
+    const token = tokenResp.token;
+
+    // First try advertised stream URL (rewritten by vite proxy)
+    let stream: Response | null = null;
+    let streamErr: unknown = null;
+
+    const tryStreamUrl = async (u: string) => {
+      try {
+        const r = await postStream(u, token);
+        return r;
+      } catch (e) {
+        streamErr = e;
+        return null;
+      }
+    };
+
+    // (a) Use the provided stream_url (if present)
+    if (tokenResp.stream_url) {
+      // If the server gave an absolute /stream or /chat, hit it via the UI host:
+      // The vite proxy maps /chat and /stream for us.
+      const advertised = tokenResp.stream_url;
+      // Normalize to UI base
+      const normalized =
+        advertised.startsWith("http")
+          ? advertised.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i, streamHost)
+          : `${streamHost}${advertised.startsWith("/") ? "" : "/"}${advertised}`;
+      stream = await tryStreamUrl(normalized);
+    }
+
+    // (b) Fallback to /chat
+    if (!stream) {
+      stream = await tryStreamUrl(`${streamHost}/chat`);
+    }
+
+    // (c) Fallback to /stream/chat
+    if (!stream) {
+      stream = await tryStreamUrl(`${streamHost}/stream/chat`);
+    }
+
+    // (d) Final fallback to /stream (LiteLLM often uses this)
+    if (!stream) {
+      stream = await tryStreamUrl(`${streamHost}/stream`);
+    }
+
+    if (!stream || !stream.body) {
+      throw new Error(`Unable to open stream. ${streamErr ? String(streamErr) : "No body returned."}`);
+    }
+
+    // 3) Read the SSE and update UI
+    const reader = stream.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let accumulatedResponse = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const textChunk = decoder.decode(value, { stream: true });
+      const lines = textChunk.split("\n").filter((line) => line.trim() !== "");
+      for (let line of lines) {
+        if (line.startsWith("data:")) line = line.slice(5).trim();
+        if (!line) continue;
+        try {
+          const json = JSON.parse(line) as { token?: string; done?: boolean };
+          if (json.token) {
+            accumulatedResponse += json.token;
+            setMessages((prev) => {
+              const newMsgs = [...prev];
+              const idx = newMsgs.length - 1;
+              if (idx >= 0) {
+                newMsgs[idx] = { role: "assistant", content: accumulatedResponse, isStreaming: true };
+              }
+              return newMsgs;
+            });
+          }
+        } catch (e) {
+          // non-JSON lines harmless
+          console.debug("Non-JSON SSE line:", line);
+        }
+      }
+    }
+
+    // finalize
+    setMessages((prev) => {
+      const newMsgs = [...prev];
+      const idx = newMsgs.length - 1;
+      if (idx >= 0) {
+        newMsgs[idx] = { role: "assistant", content: accumulatedResponse, isStreaming: false };
+      }
+      return newMsgs;
+    });
+  } catch (err: any) {
+    console.error("Error in agent request:", err);
+
+    // If it was a 500 from /request, be explicit
+    if (String(err).includes("AIM error 500")) {
+      toast.error("The model backend hit an internal error. Try a simpler prompt or retry in a moment.");
+    } else if (/invalid\s*nonce/i.test(String(err))) {
+      toast.error("Wallet signature nonce was invalid. Please try again.");
+    } else {
+      toast.error("Error in agent request: " + String(err));
+    }
+
+    // Show a clean error bubble
+    setMessages((prev) => {
+      const newMsgs = [...prev];
+      const idx = newMsgs.length - 1;
+      if (idx >= 0) {
+        newMsgs[idx] = {
+          role: "assistant",
+          content: "Sorry—there was a problem talking to the model. Please try again.",
+          isStreaming: false,
+          error: true,
+        };
+      }
+      return newMsgs;
+    });
+  } finally {
+    setIsLoading(false);
+  }
+};
 
   /**
    * Hybrid model discovery:
-   * 1) Try /aim/:slot/models (LiteLLM-style; map object or arrays)
+   * 1) Try /aim/:slot/models (LiteLLM-style; map/object or arrays)
    * 2) Fallback to /aim/:slot/manifest.json (Ollama-style)
    */
   const getAvailableModels = async () => {
     const nodeUrl = import.meta.env.VITE_NODE_URL as string; // e.g. https://IP:PORT
-    const slot = import.meta.env.VITE_AIM_SLOT as string;    // e.g. 0
-    const action = import.meta.env.VITE_AIM_URI as string;   // e.g. /request
+    const slot    = import.meta.env.VITE_AIM_SLOT as string; // e.g. "0"
+    const action  = import.meta.env.VITE_AIM_URI as string;  // e.g. "/request"
 
     const uniq = (arr: string[]) => Array.from(new Set(arr.filter(Boolean)));
 
@@ -366,7 +360,7 @@ const ChatProvider: React.FC<ChatProviderProps> = ({ children }) => {
     }
   };
 
-  // TODO: Needs to be fixed
+  // Deposit / addBalance (unchanged)
   const addBalance = async (amount: number) => {
     setIsLoading(true);
     const nodeUrl = import.meta.env.VITE_NODE_URL as string;
@@ -405,14 +399,11 @@ const ChatProvider: React.FC<ChatProviderProps> = ({ children }) => {
         ? `${addTrailingSlash(nodeUrl)}balance`
         : `http://${addTrailingSlash(nodeUrl).replace("http://", "")}balance`;
 
-      const res = await fetch(url, { method: "post", headers: headers });
+      const res = await fetch(url, { method: "post", headers });
       const paymentRequest = await res.json();
       console.log(paymentRequest, "deposit response", txReceipt);
-
       if (!paymentRequest) {
-        throw new Error(
-          "Problem creating payment request, check connector or reconnect wallet."
-        );
+        throw new Error("Problem creating payment request, check connector or reconnect wallet.");
       }
       toast.success("Founds added successfully!");
     } catch (error) {

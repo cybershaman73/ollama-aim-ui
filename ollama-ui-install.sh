@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 # --- CHECK: Does the current user have sudo privileges? -----------------------
 if ! groups "$(whoami)" | grep -qw "sudo"; then
   echo "ERROR: This install script requires a user with sudo privileges."

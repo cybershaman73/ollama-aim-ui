@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# --- CHECK: Does the current user have sudo privileges? -----------------------
+if ! groups "$(whoami)" | grep -qw "sudo"; then
+  echo "ERROR: This install script requires a user with sudo privileges."
+  echo "Please run this script as a user that is a member of the 'sudo' group."
+  echo ""
+  echo "If you meant to run with sudo, try:"
+  echo "    sudo $0"
+  exit 1
+fi
 set -euo pipefail
 
 # ──────────────────────────────────────────────────────────────────────────────
